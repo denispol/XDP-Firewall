@@ -2,6 +2,9 @@
 
 #include <xdp/libxdp.h>
 
+#include <errno.h>
+#include <stdint.h>
+
 #include  <common/all.h>
 
 #include <loader/utils/config.h>
@@ -21,7 +24,8 @@ int attach_xdp(struct xdp_program *prog, char** mode, int ifidx, int detach, int
 int delete_filter(int map_filters, u32 idx);
 void delete_filters(int map_filters);
 
-int update_filter(int map_filters, filter_rule_cfg_t* filter, int idx);
+int build_filter(filter_rule_cfg_t* filter_cfg, int cfg_idx, filter_t* out);
+int update_filter(int map_filters, filter_rule_cfg_t* filter, int idx, int cfg_idx);
 void update_filters(int map_filters, config__t *cfg);
 
 int pin_bpf_map(struct bpf_object* obj, const char* pin_dir, const char* map_name);
@@ -37,3 +41,4 @@ int add_block6(int map_block6, u128 ip, u64 expires);
 int delete_range_drop(int map_range_drop, u32 net, u8 cidr);
 int add_range_drop(int map_range_drop, u32 net, u8 cidr);
 void update_range_drops(int map_range_drop, config__t* cfg);
+void remove_stale_range_drops(int map_range_drop, config__t* old_cfg, config__t* new_cfg);

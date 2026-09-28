@@ -20,10 +20,12 @@
  * @param flow_bps The current flow BPS rate.
  * @param pkt_len The full packet length.
  * @param filter_id The filter ID that matched.
+ * @param action The matched filter's action.
+ * @param block_time The matched filter's block time.
  * 
  * @return always 0
  */
-static __always_inline int log_filter_msg(struct iphdr* iph, struct ipv6hdr* iph6, u16 src_port, u16 dst_port, u8 protocol, u64 now, u64 ip_pps, u64 ip_bps, u64 flow_pps, u64 flow_bps, int pkt_len, int filter_id)
+static __always_inline int log_filter_msg(struct iphdr* iph, struct ipv6hdr* iph6, u16 src_port, u16 dst_port, u8 protocol, u64 now, u64 ip_pps, u64 ip_bps, u64 flow_pps, u64 flow_bps, int pkt_len, int filter_id, u8 action, u32 block_time)
 {
     filter_log_event_t* e = bpf_ringbuf_reserve(&map_filter_log, sizeof(*e), 0);
 
@@ -31,6 +33,15 @@ static __always_inline int log_filter_msg(struct iphdr* iph, struct ipv6hdr* iph
     {
         e->ts = now;
         e->filter_id = filter_id;
+        e->action = action;
+        e->block_time = block_time;
+
+        // Ring buffer memory isn't zeroed, so every address field must be written explicitly.
+        e->src_ip = 0;
+        e->dst_ip = 0;
+
+        memset(&e->src_ip6, 0, sizeof(e->src_ip6));
+        memset(&e->dst_ip6, 0, sizeof(e->dst_ip6));
 
         if (iph)
         {
@@ -40,8 +51,8 @@ static __always_inline int log_filter_msg(struct iphdr* iph, struct ipv6hdr* iph
 #ifdef ENABLE_IPV6
         else if (iph6)
         {
-            memcpy(&e->src_ip6, iph6->saddr.in6_u.u6_addr32, 4);
-            memcpy(&e->dst_ip6, iph6->daddr.in6_u.u6_addr32, 4);
+            memcpy(&e->src_ip6, iph6->saddr.in6_u.u6_addr32, sizeof(e->src_ip6));
+            memcpy(&e->dst_ip6, iph6->daddr.in6_u.u6_addr32, sizeof(e->dst_ip6));
         }
 #endif
 

@@ -192,14 +192,35 @@ int attach_xdp(struct xdp_program *prog, char** mode, int ifidx, int detach, int
 /**
  * Deletes a filter.
  * 
+ * The filters map is a (per-CPU) array map which doesn't support deleting elements, so the filter is cleared (zeroed) instead.
+ * The XDP program stops processing filters once it reaches an unset filter.
+ * 
  * @param map_filters The filters BPF map FD.
  * @param idx The filter index to delete.
  * 
- * @return 0 on success or the error value of bpf_map_delete_elem().
+ * @return 0 on success or the error value of bpf_map_update_elem().
  */
 int delete_filter(int map_filters, u32 idx)
 {
-    return bpf_map_delete_elem(map_filters, &idx);
+    int cpus = libbpf_num_possible_cpus();
+
+    if (cpus < 1)
+    {
+        return cpus;
+    }
+
+    filter_t* filter_cpus = calloc(cpus, sizeof(filter_t));
+
+    if (!filter_cpus)
+    {
+        return -ENOMEM;
+    }
+
+    int ret = bpf_map_update_elem(map_filters, &idx, filter_cpus, BPF_ANY);
+
+    free(filter_cpus);
+
+    return ret;
 }
 
 /**
@@ -218,23 +239,43 @@ void delete_filters(int map_filters)
 }
 
 /**
- * Updates a filter rule.
+ * Checks if an optional integer config value (negative = unset) is within range.
  * 
- * @param map_filters The filters BPF map FD.
- * @param filter_cfg A pointer to the filter config rule.
- * @param idx The filter index to insert or update.
+ * @param val The value.
+ * @param min The minimum value allowed.
+ * @param max The maximum value allowed.
  * 
- * @return 0 on success or error value of bpf_map_update_elem().
+ * @return 1 if the value is unset or valid and 0 otherwise.
  */
-int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
+static int is_opt_valid(s64 val, s64 min, s64 max)
+{
+    return val < 0 || (val >= min && val <= max);
+}
+
+/**
+ * Converts a filter config rule into the filter structure used by the XDP program.
+ * 
+ * @param filter_cfg A pointer to the filter config rule.
+ * @param cfg_idx The filter's index inside of the config (used for logging).
+ * @param out A pointer to the filter structure to fill out.
+ * 
+ * @return 0 on success or -EINVAL on invalid filter settings.
+ */
+int build_filter(filter_rule_cfg_t* filter_cfg, int cfg_idx, filter_t* out)
 {
     filter_t filter = {0};
 
     filter.set = filter_cfg->set;
+    filter.id = cfg_idx;
 
-    if (!filter_cfg->enabled)
+    // Validate settings that would otherwise be truncated when stored inside of the BPF map.
+    if (!is_opt_valid(filter_cfg->action, 0, 1) || !is_opt_valid(filter_cfg->block_time, 0, UINT32_MAX) ||
+        !is_opt_valid(filter_cfg->ip.min_ttl, 0, 255) || !is_opt_valid(filter_cfg->ip.max_ttl, 0, 255) ||
+        !is_opt_valid(filter_cfg->ip.min_len, 0, 65535) || !is_opt_valid(filter_cfg->ip.max_len, 0, 65535) ||
+        !is_opt_valid(filter_cfg->ip.tos, 0, 255) ||
+        !is_opt_valid(filter_cfg->icmp.code, 0, 255) || !is_opt_valid(filter_cfg->icmp.type, 0, 255))
     {
-        return 0;
+        return -EINVAL;
     }
     
     if (filter_cfg->enabled > -1)
@@ -293,6 +334,11 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     {
         ip_range_t ip_range = parse_ip_range(filter_cfg->ip.src_ip);
 
+        if (!ip_range.success)
+        {
+            return -EINVAL;
+        }
+
         filter.ip.src_ip = ip_range.ip;
         filter.ip.src_cidr = ip_range.cidr;
     }
@@ -301,6 +347,11 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     {
         ip_range_t ip_range = parse_ip_range(filter_cfg->ip.dst_ip);
 
+        if (!ip_range.success)
+        {
+            return -EINVAL;
+        }
+
         filter.ip.dst_ip = ip_range.ip;
         filter.ip.dst_cidr = ip_range.cidr;
     }
@@ -308,23 +359,24 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
 #ifdef ENABLE_IPV6
     if (filter_cfg->ip.src_ip6)
     {
-        struct in6_addr in;
+        if (parse_ip6_range(filter_cfg->ip.src_ip6, filter.ip.src_ip6, filter.ip.src_mask6) != 0)
+        {
+            return -EINVAL;
+        }
 
-        inet_pton(AF_INET6, filter_cfg->ip.src_ip6, &in);
-
-        memcpy(filter.ip.src_ip6, in.__in6_u.__u6_addr32, 4);
+        filter.ip.do_src_ip6 = 1;
     }
 
     if (filter_cfg->ip.dst_ip6)
     {
-        struct in6_addr in;
+        if (parse_ip6_range(filter_cfg->ip.dst_ip6, filter.ip.dst_ip6, filter.ip.dst_mask6) != 0)
+        {
+            return -EINVAL;
+        }
 
-        inet_pton(AF_INET6, filter_cfg->ip.dst_ip6, &in);
-
-        memcpy(filter.ip.dst_ip6, in.__in6_u.__u6_addr32, 4);
+        filter.ip.do_dst_ip6 = 1;
     }
 #endif
-
     if (filter_cfg->ip.min_ttl > -1)
     {
         filter.ip.do_min_ttl = 1;
@@ -367,6 +419,12 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
 
     port_range_t tcp_src_port_range = parse_port_range(filter_cfg->tcp.sport);
 
+    // A port string that is set but can't be parsed must not silently turn into "any port".
+    if (filter_cfg->tcp.sport && !tcp_src_port_range.success)
+    {
+        return -EINVAL;
+    }
+
     if (tcp_src_port_range.success)
     {
         filter.tcp.do_sport_min = 1;
@@ -377,6 +435,12 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     }
 
     port_range_t tcp_dst_port_range = parse_port_range(filter_cfg->tcp.dport);
+
+    // A port string that is set but can't be parsed must not silently turn into "any port".
+    if (filter_cfg->tcp.dport && !tcp_dst_port_range.success)
+    {
+        return -EINVAL;
+    }
 
     if (tcp_dst_port_range.success)
     {
@@ -450,6 +514,12 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
 
     port_range_t udp_src_port_range = parse_port_range(filter_cfg->udp.sport);
 
+    // A port string that is set but can't be parsed must not silently turn into "any port".
+    if (filter_cfg->udp.sport && !udp_src_port_range.success)
+    {
+        return -EINVAL;
+    }
+
     if (udp_src_port_range.success)
     {
         filter.udp.do_sport_min = 1;
@@ -460,6 +530,12 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     }
 
     port_range_t udp_dst_port_range = parse_port_range(filter_cfg->udp.dport);
+
+    // A port string that is set but can't be parsed must not silently turn into "any port".
+    if (filter_cfg->udp.dport && !udp_dst_port_range.success)
+    {
+        return -EINVAL;
+    }
 
     if (udp_dst_port_range.success)
     {
@@ -489,19 +565,69 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
         filter.icmp.type = filter_cfg->icmp.type;
     }
 
-    filter_t filter_cpus[MAX_CPUS];
-    memset(filter_cpus, 0, sizeof(filter_cpus));
+    *out = filter;
 
-    for (int j = 0; j < MAX_CPUS; j++)
+    return 0;
+}
+
+/**
+ * Updates a filter rule.
+ * 
+ * @param map_filters The filters BPF map FD.
+ * @param filter_cfg A pointer to the filter config rule.
+ * @param idx The filter index to insert or update.
+ * @param cfg_idx The filter's index inside of the config (used for logging).
+ * 
+ * @return 0 on success, -EINVAL on invalid filter settings, or error value of bpf_map_update_elem().
+ */
+int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx, int cfg_idx)
+{
+    if (!filter_cfg->enabled)
+    {
+        return 0;
+    }
+
+    filter_t filter;
+
+    int ret = build_filter(filter_cfg, cfg_idx, &filter);
+
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    // Per-CPU maps expect a value for every possible CPU.
+    int cpus = libbpf_num_possible_cpus();
+
+    if (cpus < 1)
+    {
+        return cpus;
+    }
+
+    filter_t* filter_cpus = calloc(cpus, sizeof(filter_t));
+
+    if (!filter_cpus)
+    {
+        return -ENOMEM;
+    }
+
+    for (int j = 0; j < cpus; j++)
     {
         filter_cpus[j] = filter;
     }
 
-    return bpf_map_update_elem(map_filters, &idx, &filter_cpus, BPF_ANY);
+    ret = bpf_map_update_elem(map_filters, &idx, filter_cpus, BPF_ANY);
+
+    free(filter_cpus);
+
+    return ret;
 }
 
 /**
  * Updates the filter's BPF map with current config settings.
+ * 
+ * Set and enabled filters are inserted in order starting from index 0 and all remaining indexes are cleared
+ * so that filters removed from the config don't stay active inside of the XDP program.
  * 
  * @param map_filters The filter's BPF map FD.
  * @param cfg A pointer to the config structure.
@@ -514,12 +640,8 @@ void update_filters(int map_filters, config__t *cfg)
     int cur_idx = 0;
 
     // Add a filter to the filter maps.
-    for (int i = 0; i < cfg->filters_cnt; i++)
+    for (int i = 0; i < MAX_FILTERS; i++)
     {
-        // Delete previous rule from BPF map.
-        // We do this in the case rules were edited and were put out of order since the key doesn't uniquely map to a specific rule.
-        delete_filter(map_filters, i);
-
         filter_rule_cfg_t* filter = &cfg->filters[i];
 
         // Only insert set and enabled filters.
@@ -529,14 +651,30 @@ void update_filters(int map_filters, config__t *cfg)
         }
 
         // Attempt to update filter.
-        if ((ret = update_filter(map_filters, filter, cur_idx)) != 0)
+        if ((ret = update_filter(map_filters, filter, cur_idx, i)) != 0)
         {
-            fprintf(stderr, "[WARNING] Failed to update filter #%d due to BPF update error (%d)...\n", cur_idx, ret);
+            if (ret == -EINVAL)
+            {
+                fprintf(stderr, "[WARNING] Skipping filter #%d due to invalid settings...\n", i + 1);
+            }
+            else
+            {
+                fprintf(stderr, "[WARNING] Failed to update filter #%d due to BPF update error (%d)...\n", i + 1, ret);
+            }
 
             continue;
         }
 
         cur_idx++;
+    }
+
+    // Clear the rest of the filters (e.g. filters that were removed from the config).
+    for (int i = cur_idx; i < MAX_FILTERS; i++)
+    {
+        if ((ret = delete_filter(map_filters, i)) != 0)
+        {
+            fprintf(stderr, "[WARNING] Failed to clear filter at index %d (%d)...\n", i, ret);
+        }
     }
 }
 
@@ -669,7 +807,7 @@ int add_block6(int map_block6, u128 ip, u64 expires)
  */
 int delete_range_drop(int map_range_drop, u32 net, u8 cidr)
 {
-    u32 bit_mask = htonl(( ~( (1 << (32 - cidr) ) - 1) ));
+    u32 bit_mask = get_cidr_mask(cidr);
     u32 start = net & bit_mask;
 
     lpm_trie_key_t key = {0};
@@ -690,7 +828,7 @@ int delete_range_drop(int map_range_drop, u32 net, u8 cidr)
  */
 int add_range_drop(int map_range_drop, u32 net, u8 cidr)
 {
-    u32 bit_mask = htonl(( ~( (1 << (32 - cidr) ) - 1) ));
+    u32 bit_mask = get_cidr_mask(cidr);
     u32 start = net & bit_mask;
 
     lpm_trie_key_t key = {0};
@@ -724,6 +862,68 @@ void update_range_drops(int map_range_drop, config__t* cfg)
         // Parse IP range string and return network IP and CIDR.
         ip_range_t t = parse_ip_range(range);
 
-        add_range_drop(map_range_drop, t.ip, t.cidr);
+        if (!t.success)
+        {
+            fprintf(stderr, "[WARNING] Skipping invalid IP drop range '%s'...\n", range);
+
+            continue;
+        }
+
+        int ret;
+
+        if ((ret = add_range_drop(map_range_drop, t.ip, t.cidr)) != 0)
+        {
+            fprintf(stderr, "[WARNING] Failed to add IP drop range '%s' (%d)...\n", range, ret);
+        }
+    }
+}
+
+/**
+ * Removes IP ranges that are in the old config, but not in the new config, from the drop map.
+ * 
+ * @param map_range_drop The IPv4 range drop map's FD.
+ * @param old_cfg A pointer to the old config.
+ * @param new_cfg A pointer to the new config.
+ * 
+ * @return void
+ */
+void remove_stale_range_drops(int map_range_drop, config__t* old_cfg, config__t* new_cfg)
+{
+    for (int i = 0; i < MAX_IP_RANGES; i++)
+    {
+        const char* range = old_cfg->drop_ranges[i];
+
+        if (!range)
+        {
+            continue;
+        }
+
+        int found = 0;
+
+        for (int j = 0; j < MAX_IP_RANGES; j++)
+        {
+            const char* new_range = new_cfg->drop_ranges[j];
+
+            if (new_range && strcmp(range, new_range) == 0)
+            {
+                found = 1;
+
+                break;
+            }
+        }
+
+        if (found)
+        {
+            continue;
+        }
+
+        ip_range_t t = parse_ip_range(range);
+
+        if (!t.success)
+        {
+            continue;
+        }
+
+        delete_range_drop(map_range_drop, t.ip, t.cidr);
     }
 }

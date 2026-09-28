@@ -10,7 +10,7 @@ u64 last_passed = 0;
  * Calculates and displays packet counters/stats.
  * 
  * @param map_stats The stats map BPF FD.
- * @param cpus The amount of CPUs the host has.
+ * @param cpus The amount of possible CPUs the host has (see libbpf_num_possible_cpus()).
  * @param per_second Calculate packet counters per second (PPS).
  * 
  * @return 0 on success or 1 on failure.
@@ -19,8 +19,18 @@ int calc_stats(int map_stats, int cpus, int per_second)
 {
     u32 key = 0;
 
-    stats_t stats[MAX_CPUS];
-    memset(stats, 0, sizeof(stats));
+    if (cpus < 1)
+    {
+        return EXIT_FAILURE;
+    }
+
+    // Per-CPU map lookups copy a value for every possible CPU, so the buffer must be sized accordingly.
+    stats_t* stats = calloc(cpus, sizeof(stats_t));
+
+    if (!stats)
+    {
+        return EXIT_FAILURE;
+    }
 
     u64 allowed = 0;
     u64 dropped = 0;
@@ -28,25 +38,19 @@ int calc_stats(int map_stats, int cpus, int per_second)
     
     if (bpf_map_lookup_elem(map_stats, &key, stats) != 0)
     {
+        free(stats);
+
         return EXIT_FAILURE;
     }
 
     for (int i = 0; i < cpus; i++)
     {
-        // Although this should NEVER happen, I'm seeing very strange behavior in the following GitHub issue.
-        // https://github.com/gamemann/XDP-Firewall/issues/10
-        // Therefore, before accessing stats[i], make sure the pointer to the specific CPU ID is not NULL.
-        if (&stats[i] == NULL)
-        {
-            fprintf(stderr, "[WARNING] Stats array at CPU ID #%d is NULL! Skipping...\n", i);
-
-            continue;
-        }
-
         allowed += stats[i].allowed;
         dropped += stats[i].dropped;
         passed += stats[i].passed;
     }
+
+    free(stats);
 
     u64 allowed_val = allowed, dropped_val = dropped, passed_val = passed;
 
@@ -71,9 +75,9 @@ int calc_stats(int map_stats, int cpus, int per_second)
         last_update_time = now;
     }
 
-    char allowed_str[12];
-    char dropped_str[12];
-    char passed_str[12];
+    char allowed_str[32];
+    char dropped_str[32];
+    char passed_str[32];
 
     if (per_second)
     {
