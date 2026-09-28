@@ -131,7 +131,7 @@ all: loader xdp rule_add rule_del
 
 # Loader program.
 loader: loader_utils
-	$(CC) $(INCS) $(FLAGS) $(FLAGS_LOADER) -o $(BUILD_LOADER_DIR)/$(LOADER_OUT) $(LOADER_OBJS) $(LOADER_DIR)/$(LOADER_SRC)
+	$(CC) $(INCS) $(FLAGS) -o $(BUILD_LOADER_DIR)/$(LOADER_OUT) $(LOADER_OBJS) $(LOADER_DIR)/$(LOADER_SRC) $(FLAGS_LOADER)
 
 loader_utils: loader_utils_config loader_utils_cli loader_utils_helpers loader_utils_xdp loader_utils_logging loader_utils_stats
 
@@ -159,7 +159,7 @@ xdp:
 
 # Rule add.
 rule_add: loader_utils rule_add_utils
-	$(CC) $(INCS) $(FLAGS) $(FLAGS_LOADER) -o $(BUILD_RULE_ADD_DIR)/$(RULE_ADD_OUT) $(RULE_OBJS) $(RULE_ADD_OBJS) $(RULE_ADD_DIR)/$(RULE_ADD_SRC)
+	$(CC) $(INCS) $(FLAGS) -o $(BUILD_RULE_ADD_DIR)/$(RULE_ADD_OUT) $(RULE_OBJS) $(RULE_ADD_OBJS) $(RULE_ADD_DIR)/$(RULE_ADD_SRC) $(FLAGS_LOADER)
 
 rule_add_utils: rule_add_utils_cli
 
@@ -168,7 +168,7 @@ rule_add_utils_cli:
 
 # Rule delete.
 rule_del: loader_utils rule_del_utils
-	$(CC) $(INCS) $(FLAGS) $(FLAGS_LOADER) -o $(BUILD_RULE_DEL_DIR)/$(RULE_DEL_OUT) $(RULE_OBJS) $(RULE_DEL_OBJS) $(RULE_DEL_DIR)/$(RULE_DEL_SRC)
+	$(CC) $(INCS) $(FLAGS) -o $(BUILD_RULE_DEL_DIR)/$(RULE_DEL_OUT) $(RULE_OBJS) $(RULE_DEL_OBJS) $(RULE_DEL_DIR)/$(RULE_DEL_SRC) $(FLAGS_LOADER)
 
 rule_del_utils: rule_del_utils_cli
 
@@ -199,6 +199,9 @@ install:
 	cp -f $(BUILD_RULE_DEL_DIR)/$(RULE_DEL_OUT) /usr/bin
 
 	cp -f $(BUILD_XDP_DIR)/$(XDP_OBJ) $(ETC_DIR)
+
+	cp -f other/xdpfw-cleanup.sh $(ETC_DIR)
+	chmod +x $(ETC_DIR)/xdpfw-cleanup.sh
 
 clean:	
 	find $(BUILD_DIR) -type f ! -name ".*" -exec rm -f {} +
