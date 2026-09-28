@@ -173,7 +173,7 @@ Here are more details on the layout of the runtime configuration.
 | enabled | bool | `true` | Whether the rule is enabled or not. |
 | log | bool | `false` | Whether to log packets that are matched. |
 | action | int | `1` | The value of `0` drops or blocks the packet while `1` allows/passes the packet through. |
-| block_time | int | `1` | The amount of seconds to block the source IP for if matched. |
+| block_time | int | `1` | The amount of seconds to block the source IP for if matched and the action is drop (`0` = don't block). Blocked source IPs are dropped for all protocols. |
 | ip_pps | int64 | `NULL` | Matches if this threshold of packets per second is exceeded for a source IP. |
 | ip_bps | int64 | `NULL` | Matches if this threshold of bytes per second is exceeded for a source IP. |
 | flow_pps | int64 | `NULL` | Matches if this threshold of packets per second is exceeded for a source flow (IP and port). |
@@ -184,13 +184,13 @@ Here are more details on the layout of the runtime configuration.
 | ---- | ---- | ------- | ----------- |
 | src_ip | string | `NULL` | The source IPv4 address to match (e.g. `10.50.0.3`). CIDRs are also supported (e.g. `10.50.0.0/24`)! |
 | dst_ip | string | `NULL` | The destination IPv4 address to match (e.g. `10.50.0.4`). CIDRs are also supported (e.g. `10.50.0.0/24`)! |
-| src_ip6 | string | `NULL` | The source IPv6 address to match (e.g. `fe80::18c4:dfff:fe70:d8a6`). |
-| dst_ip6 | string | `NULL` | The destination IPv6 address to match (e.g. `fe80::ac21:14ff:fe4b:3a6d`). |
+| src_ip6 | string | `NULL` | The source IPv6 address to match (e.g. `fe80::18c4:dfff:fe70:d8a6`). Prefixes are also supported (e.g. `2001:db8::/32`)! |
+| dst_ip6 | string | `NULL` | The destination IPv6 address to match (e.g. `fe80::ac21:14ff:fe4b:3a6d`). Prefixes are also supported (e.g. `2001:db8::/32`)! |
 | min_ttl | int | `NULL` | The minimum TTL (time-to-live) to match. |
 | max_ttl | int | `NULL` | The maximum TTL (time-to-live) to match. |
 | min_len | int | `NULL` | The minimum packet length to match (includes the entire packet including the ethernet header and payload). |
 | max_len | int | `NULL` | The maximum packet length to match (includes the entire packet including the ethernet header and payload). |
-| tos | int | `NULL` | The ToS (type-of-service) to match. |
+| tos | int | `NULL` | The ToS (type-of-service) to match. For IPv6 packets, this matches the traffic class. |
 
 #### TCP Options
 You may additionally specified TCP header options for a filter rule which start with `tcp_`.
@@ -219,7 +219,7 @@ You may additionally specified UDP header options for a filter rule which start 
 | udp_dport | int \| string | `NULL` | The UDP destination port to match with single range support (e.g., `"27000-27015"`). |
 
 #### ICMP Options
-You may additionally specified UDP header options for a filter rule which start with `icmp_`.
+You may additionally specified ICMP header options for a filter rule which start with `icmp_`. These options apply to both ICMP (IPv4) and ICMPv6 (IPv6) packets.
 
 | Name | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
@@ -231,6 +231,9 @@ You may additionally specified UDP header options for a filter rule which start 
 * When a setting field inside of a filter rule is not set or if it's set to `-1` (or `NULL`), the default setting value will be used (see [`set_filter_defaults()`](https://github.com/gamemann/XDP-Firewall/blob/master/src/loader/utils/config.c#L1047)).
 * When a filter rule's setting is set, but doesn't match the packet, the program moves onto the next filter rule. Therefore, all of the filter rule's settings that are set must match the packet in order to perform the action specified. Think of it as something like `if src_ip == "10.50.0.3" and udp_dport == 27015: action`. 
 * As of right now, you can specify up to **1000 total** dynamic filter rules. You may increase this limit by raising the `MAX_FILTERS` constant in the `src/common/config.h` [file](https://github.com/gamemann/XDP-Firewall/blob/master/src/common/config.h#L5) and then recompile the firewall.
+* If more than one of `tcp_enabled`, `udp_enabled`, and `icmp_enabled` are set on a filter rule, the packet must match one of the enabled protocols (and its options).
+* Filter rules with invalid settings (e.g. an invalid IP address/CIDR, a port outside of `0 - 65535`, or a TTL/ToS/ICMP value outside of `0 - 255`) are skipped with a warning instead of being loaded with truncated values.
+* IPv6 extension headers (hop-by-hop, routing, destination options, fragment, and authentication headers) are skipped to find the layer-4 header. Fragments other than the first fragment don't contain a layer-4 header, so they only match filter rules without TCP, UDP, or ICMP options.
 * At this time, each port value supports a single port range per filter rule. This is because adding support for multiple ports/port ranges would require an additional `for` loop which would make the BPF program larger and result in slower performance, etc.
 
 ### Runtime Example
@@ -289,7 +292,7 @@ The following general CLI arguments are supported with these utilities.
 | -c, --cfg | `-c ./local/conf` | The path to the configuration file (required if the save argument is specified or if you're using dynamic filters mode). |
 | -s, --save | `-s` | Updates the runtime config file. |
 | -m, --mode | `-m 1` | The mode to use (0 = dynamic filters, 1 = IP range drop list, 2 = source IP block list). |
-| -i, --idx | `-i 3` | The index to update or delete when running in filters mode. |
+| -i, --idx | `-i 3` | The index to update or delete when running in filters mode (starts from 1; retrieve the index using `xdpfw -l`). |
 | -d, --ip | `-d 192.168.1.0/24` | The IP range or source IP when running in IP range drop list or source IP block list modes. |
 | -v, --v6 | `-v` | Parses and adds the IP address as IPv6 when running in source IP block list mode. |
 
@@ -308,8 +311,8 @@ The following CLI arguments are supported.
 | --block-time | `--block-time 60` | How long to block the source IP for if the packet is matched and the action is drop in the dynamic filter (0 = no time). | 
 | --sip | `--sip 192.168.1.0/24` | The source IPv4 address/range to match with the dynamic filter. |
 | --dip | `--dip 10.90.0.0/24` | The destination IPv4 address/range to match with the dynamic filter. |
-| --sip6 | `--sip6 192.168.1.0/24` | The source IPv6 address to match with the dynamic filter. |
-| --dip6 | `--dip6 192.168.1.0/24` | The destination IPv6 address to match with the dynamic filter. |
+| --sip6 | `--sip6 2001:db8::/32` | The source IPv6 address/prefix to match with the dynamic filter. |
+| --dip6 | `--dip6 2001:db8::1` | The destination IPv6 address/prefix to match with the dynamic filter. |
 | --min-ttl | `--min-ttl 0` | The IP's minimum TTL to match with the dynamic filter. |
 | --max-ttl | `--max-ttl 6` | The IP's maximum TTL to match with the dynamic filter. |
 | --min-len | `--min-len 42` | The packet's mimimum length to match with the dynamic filter. |

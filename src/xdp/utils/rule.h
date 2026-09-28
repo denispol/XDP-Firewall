@@ -29,20 +29,26 @@ struct rule_ctx
 
 #ifdef ENABLE_FILTER_LOGGING
     u64 now;
+#endif
 
+    // Layer-4 information is copied into scalars (instead of storing header pointers) which keeps verifier complexity low.
     u8 protocol;
+
+    // The layer-4 protocol whose header was parsed (0 if there is no layer-4 header such as with non-first fragments).
+    u8 l4_proto;
+
+    // Ports in network byte order.
     u16 src_port;
     u16 dst_port;
-#endif
+
+    // TCP flags byte (CWR, ECE, URG, ACK, PSH, RST, SYN, FIN from most to least significant bit).
+    u8 tcp_flags;
+
+    u8 icmp_type;
+    u8 icmp_code;
 
     struct iphdr* iph;
     struct ipv6hdr* iph6;
-
-    struct tcphdr* tcph;
-    struct udphdr* udph;
-    struct icmphdr* icmph;
-
-    struct icmp6hdr* icmph6;
 } typedef rule_ctx_t;
 
 #ifdef ENABLE_FILTERS

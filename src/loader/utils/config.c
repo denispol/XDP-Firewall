@@ -46,6 +46,7 @@ int load_cfg(config__t *cfg, const char* cfg_file, int load_defaults, config_ove
     {
         fprintf(stderr, "Error parsing config file.\n");
 
+        free(buffer);
         close_cfg(file);
 
         return ret;
@@ -212,14 +213,31 @@ int parse_cfg(config__t *cfg, const char* data, config_overrides_t* overrides)
     // Get interface(s).
     config_setting_t* interfaces = config_lookup(&conf, "interface");
 
+    if (interfaces || (overrides && overrides->interface))
+    {
+        // Replace any previously loaded interfaces.
+        for (int i = 0; i < MAX_INTERFACES; i++)
+        {
+            if (cfg->interfaces[i])
+            {
+                free(cfg->interfaces[i]);
+                cfg->interfaces[i] = NULL;
+            }
+        }
+
+        cfg->interfaces_cnt = 0;
+    }
+
     if (interfaces)
     {
         if (config_setting_is_list(interfaces))
         {
             for (int i = 0; i < config_setting_length(interfaces); i++)
             {
-                if (i >= MAX_INTERFACES)
+                if (cfg->interfaces_cnt >= MAX_INTERFACES)
                 {
+                    log_msg(cfg, 1, 0, "[WARNING] Only the first %d interfaces are used (MAX_INTERFACES).", MAX_INTERFACES);
+
                     break;
                 }
 
@@ -230,57 +248,39 @@ int parse_cfg(config__t *cfg, const char* data, config_overrides_t* overrides)
                     continue;
                 }
 
-                if (cfg->interfaces[i])
+                // The CLI override replaces the first interface.
+                if (cfg->interfaces_cnt == 0 && overrides && overrides->interface)
                 {
-                    free(cfg->interfaces[i]);
-                    cfg->interfaces[i] = NULL;
+                    interface = overrides->interface;
                 }
 
-                if (i == 0 && overrides && overrides->interface)
-                {
-                    cfg->interfaces[i] = strdup(overrides->interface);
-                }
-                else
-                {
-                    cfg->interfaces[i] = strdup(interface);
-                }
+                cfg->interfaces[cfg->interfaces_cnt++] = strdup(interface);
+            }
 
-                cfg->interfaces_cnt++;
+            // Make sure the CLI override is used even if the list is empty.
+            if (cfg->interfaces_cnt == 0 && overrides && overrides->interface)
+            {
+                cfg->interfaces[cfg->interfaces_cnt++] = strdup(overrides->interface);
             }
         }
         else
         {
             const char* interface;
 
-            if (config_lookup_string(&conf, "interface", &interface) == CONFIG_TRUE)
+            if (overrides && overrides->interface)
             {
-                if (cfg->interfaces[0])
-                {
-                    free(cfg->interfaces[0]);
-                    cfg->interfaces[0] = NULL;
-                }
-
-                if (overrides && overrides->interface)
-                {
-                    cfg->interfaces[0] = strdup(overrides->interface);
-                }
-                else
-                {
-                    cfg->interfaces[0] = strdup(interface);
-                }
-
+                cfg->interfaces[0] = strdup(overrides->interface);
+                cfg->interfaces_cnt = 1;
+            }
+            else if (config_lookup_string(&conf, "interface", &interface) == CONFIG_TRUE)
+            {
+                cfg->interfaces[0] = strdup(interface);
                 cfg->interfaces_cnt = 1;
             }
         }
     }
     else if (overrides && overrides->interface)
     {
-        if (cfg->interfaces[0])
-        {
-            free(cfg->interfaces[0]);
-            cfg->interfaces[0] = NULL;
-        }
-
         cfg->interfaces[0] = strdup(overrides->interface);
         cfg->interfaces_cnt = 1;
     }
@@ -365,20 +365,37 @@ int parse_cfg(config__t *cfg, const char* data, config_overrides_t* overrides)
 
     if (setting && config_setting_is_list(setting))
     {
-        for (int i = 0; i < config_setting_length(setting); i++)
+        // Clear previously loaded filters.
+        for (int i = 0; i < MAX_FILTERS; i++)
+        {
+            set_filter_defaults(&cfg->filters[i]);
+        }
+
+        cfg->filters_cnt = 0;
+
+        int filters_len = config_setting_length(setting);
+
+        if (filters_len > MAX_FILTERS)
+        {
+            log_msg(cfg, 0, 1, "[WARNING] Config has %d filters, but only %d are allowed (MAX_FILTERS). Ignoring the rest...", filters_len, MAX_FILTERS);
+
+            filters_len = MAX_FILTERS;
+        }
+
+        for (int i = 0; i < filters_len; i++)
         {
             filter_rule_cfg_t* filter = &cfg->filters[i];
 
             config_setting_t* filter_cfg = config_setting_get_elem(setting, i);
 
-            if (filter == NULL || filter_cfg == NULL)
+            if (filter_cfg == NULL)
             {
-                log_msg(cfg, 0, 1, "[WARNING] Failed to read filter rule at index #%d. 'filter' or 'filter_cfg' is NULL (make sure you didn't exceed the maximum filters allowed!)...");
+                log_msg(cfg, 0, 1, "[WARNING] Failed to read filter rule at index #%d...", i + 1);
 
                 continue;
             }
 
-            cfg->filters_cnt++;
+            cfg->filters_cnt = i + 1;
 
             // Make sure filter is set.
             filter->set = 1;
@@ -746,16 +763,20 @@ int parse_cfg(config__t *cfg, const char* data, config_overrides_t* overrides)
 
     if (setting && config_setting_is_list(setting))
     {
-        for (int i = 0; i < config_setting_length(setting) && i < MAX_IP_RANGES; i++)
+        // Clear previously loaded ranges.
+        for (int i = 0; i < MAX_IP_RANGES; i++)
         {
-            const char* range = cfg->drop_ranges[i];
-
             if (cfg->drop_ranges[i])
             {
                 free(cfg->drop_ranges[i]);
                 cfg->drop_ranges[i] = NULL;
             }
+        }
 
+        cfg->drop_ranges_cnt = 0;
+
+        for (int i = 0; i < config_setting_length(setting) && cfg->drop_ranges_cnt < MAX_IP_RANGES; i++)
+        {
             const char* new_range = config_setting_get_string_elem(setting, i);
 
             if (!new_range)
@@ -763,9 +784,7 @@ int parse_cfg(config__t *cfg, const char* data, config_overrides_t* overrides)
                 continue;
             }
 
-            cfg->drop_ranges[i] = strdup(new_range);
-
-            cfg->drop_ranges_cnt++;
+            cfg->drop_ranges[cfg->drop_ranges_cnt++] = strdup(new_range);
         }
     }
 
@@ -1326,6 +1345,26 @@ void set_cfg_defaults(config__t* cfg)
 }
 
 /**
+ * Frees all memory allocated by the config structure.
+ * 
+ * @param cfg A pointer to the config structure.
+ * 
+ * @return void
+ */
+void free_cfg(config__t* cfg)
+{
+    // Setting defaults frees all allocated strings (except the default log file which is freed below).
+    set_cfg_defaults(cfg);
+
+    if (cfg->log_file)
+    {
+        free(cfg->log_file);
+
+        cfg->log_file = NULL;
+    }
+}
+
+/**
  * Prints a filter rule.
  * 
  * @param filter A pointer to the filter rule.
@@ -1503,13 +1542,13 @@ void print_cfg(config__t* cfg)
 
     if (cfg->filters_cnt > 0)
     {
-        for (int i = 0; i < cfg->filters_cnt; i++)
+        for (int i = 0; i < MAX_FILTERS; i++)
         {
             filter_rule_cfg_t *filter = &cfg->filters[i];
     
             if (!filter->set)
             {
-                break;
+                continue;
             }
     
             print_filter(filter, i + 1);
@@ -1528,7 +1567,7 @@ void print_cfg(config__t* cfg)
 
     if (cfg->drop_ranges_cnt > 0)
     {
-        for (int i = 0; i < cfg->drop_ranges_cnt; i++)
+        for (int i = 0; i < MAX_IP_RANGES; i++)
         {
             const char* range = cfg->drop_ranges[i];
     

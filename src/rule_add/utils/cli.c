@@ -63,7 +63,7 @@ void parse_cli(cli_t* cli, int argc, char* argv[])
 {
     int c;
 
-    while ((c = getopt_long(argc, argv, "c:lhm:i:rsv", opts, NULL)) != -1)
+    while ((c = getopt_long(argc, argv, "c:hsm:i:d:ve:", opts, NULL)) != -1)
     {
         switch (c)
         {
@@ -98,7 +98,7 @@ void parse_cli(cli_t* cli, int argc, char* argv[])
                 break;
 
             case 'v':
-                cli->v6 = atoi(optarg);
+                cli->v6 = 1;
 
                 break;
 

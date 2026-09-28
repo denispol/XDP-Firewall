@@ -73,6 +73,14 @@ int xdp_prog_main(struct xdp_md *ctx)
 
             return XDP_DROP;
         }
+
+        // An IHL below 5 is malformed and would make us parse layer-4 headers from inside of the IP header.
+        if (unlikely(iph->ihl < 5))
+        {
+            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+            return XDP_DROP;
+        }
     }
 #ifdef ENABLE_IPV6
     else
@@ -89,19 +97,12 @@ int xdp_prog_main(struct xdp_md *ctx)
         memcpy(&src_ip6, iph6->saddr.in6_u.u6_addr32, sizeof(src_ip6));
     }
 #endif
-    
-    // We only want to process TCP, UDP, and ICMP protocols.
-    if ((iph && iph->protocol != IPPROTO_UDP && iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_ICMP) || (iph6 && iph6->nexthdr != IPPROTO_UDP && iph6->nexthdr != IPPROTO_TCP && iph6->nexthdr != IPPROTO_ICMP))
-    {
-        inc_pkt_stats(stats, STATS_TYPE_PASSED);
-
-        return XDP_PASS;
-    }
 
     // Retrieve nanoseconds since system boot as timestamp.
     u64 now = bpf_ktime_get_ns();
 
     // Check block map.
+    // This is done before any layer-4 processing so that blocked sources are dropped regardless of the protocol they use.
     u64 *blocked = NULL;
 
     if (iph)
@@ -155,33 +156,123 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
 #ifdef ENABLE_FILTERS
-    // Retrieve total packet length.
-    u16 pkt_len = data_end - data;
-
-    // Parse layer-4 headers and determine source port and protocol.
-    struct tcphdr *tcph = NULL;
-    struct udphdr *udph = NULL;
-    struct icmphdr *icmph = NULL;
-
-    struct icmp6hdr *icmp6h = NULL;
-
-    u16 src_port = 0;
-
-#ifdef ENABLE_FILTER_LOGGING
-    u16 dst_port = 0;
-#endif
-
+    // Determine the layer-4 protocol and where its header starts.
+    // The layer-4 header pointer is left as NULL for fragments that aren't the first fragment since they don't contain a layer-4 header.
     u8 protocol = 0;
-    
+    void *l4_hdr = NULL;
+
     if (iph)
     {
         protocol = iph->protocol;
 
-        switch (iph->protocol)
+        if (!(iph->frag_off & htons(IP_OFFSET)))
+        {
+            l4_hdr = (void *)iph + (iph->ihl * 4);
+        }
+    }
+#ifdef ENABLE_IPV6
+    else
+    {
+        protocol = iph6->nexthdr;
+        void *hdr = (void *)(iph6 + 1);
+        int non_first_frag = 0;
+
+        // Walk IPv6 extension headers so they can't be used to bypass filters.
+#pragma unroll
+        for (int i = 0; i < IPV6_MAX_EXT_HDRS; i++)
+        {
+            if (protocol == IPPROTO_HOPOPTS || protocol == IPPROTO_ROUTING || protocol == IPPROTO_DSTOPTS)
+            {
+                struct ipv6_opt_hdr *opt = hdr;
+
+                if (unlikely(opt + 1 > (struct ipv6_opt_hdr *)data_end))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+
+                protocol = opt->nexthdr;
+                hdr += (opt->hdrlen + 1) * 8;
+            }
+            else if (protocol == IPPROTO_AH)
+            {
+                struct ipv6_opt_hdr *opt = hdr;
+
+                if (unlikely(opt + 1 > (struct ipv6_opt_hdr *)data_end))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+
+                protocol = opt->nexthdr;
+                hdr += (opt->hdrlen + 2) * 4;
+            }
+            else if (protocol == IPPROTO_FRAGMENT)
+            {
+                struct ipv6_frag_hdr *frag = hdr;
+
+                if (unlikely(frag + 1 > (struct ipv6_frag_hdr *)data_end))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+
+                protocol = frag->nexthdr;
+                hdr += sizeof(struct ipv6_frag_hdr);
+
+                if (frag->frag_off & htons(IPV6_FRAG_OFFSET))
+                {
+                    non_first_frag = 1;
+
+                    break;
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (!non_first_frag)
+        {
+            l4_hdr = hdr;
+        }
+    }
+#endif
+
+    // We only want to process TCP, UDP, and ICMP protocols.
+    if (protocol != IPPROTO_UDP && protocol != IPPROTO_TCP && ((iph && protocol != IPPROTO_ICMP) || (iph6 && protocol != IPPROTO_ICMPV6)))
+    {
+        inc_pkt_stats(stats, STATS_TYPE_PASSED);
+
+        return XDP_PASS;
+    }
+
+    // Retrieve total packet length.
+    u16 pkt_len = data_end - data;
+
+    // Parse layer-4 headers and copy the information filters need.
+    u8 l4_proto = 0;
+
+    u16 src_port = 0;
+    u16 dst_port = 0;
+
+    u8 tcp_flags = 0;
+
+    u8 icmp_type = 0;
+    u8 icmp_code = 0;
+
+    if (l4_hdr)
+    {
+        switch (protocol)
         {
             case IPPROTO_TCP:
+            {
                 // Scan TCP header.
-                tcph = data + sizeof(struct ethhdr) + (iph->ihl * 4);
+                struct tcphdr *tcph = l4_hdr;
 
                 // Check TCP header.
                 if (unlikely(tcph + 1 > (struct tcphdr *)data_end))
@@ -191,17 +282,21 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
-                src_port = tcph->source;
+                l4_proto = IPPROTO_TCP;
 
-#ifdef ENABLE_FILTER_LOGGING
+                src_port = tcph->source;
                 dst_port = tcph->dest;
-#endif
+
+                // The flags are stored in the 14th byte of the TCP header.
+                tcp_flags = ((u8 *)tcph)[13];
 
                 break;
+            }
 
             case IPPROTO_UDP:
+            {
                 // Scan UDP header.
-                udph = data + sizeof(struct ethhdr) + (iph->ihl * 4);
+                struct udphdr *udph = l4_hdr;
 
                 // Check UDP header.
                 if (unlikely(udph + 1 > (struct udphdr *)data_end))
@@ -211,17 +306,18 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
-                src_port = udph->source;
+                l4_proto = IPPROTO_UDP;
 
-#ifdef ENABLE_FILTER_LOGGING
+                src_port = udph->source;
                 dst_port = udph->dest;
-#endif
 
                 break;
+            }
 
             case IPPROTO_ICMP:
+            {
                 // Scan ICMP header.
-                icmph = data + sizeof(struct ethhdr) + (iph->ihl * 4);
+                struct icmphdr *icmph = l4_hdr;
 
                 // Check ICMP header.
                 if (unlikely(icmph + 1 > (struct icmphdr *)data_end))
@@ -231,59 +327,19 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
+                l4_proto = IPPROTO_ICMP;
+
+                icmp_type = icmph->type;
+                icmp_code = icmph->code;
+
                 break;
-        }
-    }
+            }
+
 #ifdef ENABLE_IPV6
-    else if (iph6)
-    {
-        protocol = iph6->nexthdr;
-
-        switch (iph6->nexthdr)
-        {
-            case IPPROTO_TCP:
-                // Scan TCP header.
-                tcph = data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
-
-                // Check TCP header.
-                if (unlikely(tcph + 1 > (struct tcphdr *)data_end))
-                {
-                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
-
-                    return XDP_DROP;
-                }
-
-                src_port = tcph->source;
-
-#ifdef ENABLE_FILTER_LOGGING
-                dst_port = tcph->dest;
-#endif
-
-                break;
-
-            case IPPROTO_UDP:
-                // Scan UDP header.
-                udph = data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
-
-                // Check TCP header.
-                if (unlikely(udph + 1 > (struct udphdr *)data_end))
-                {
-                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
-
-                    return XDP_DROP;
-                }
-
-                src_port = udph->source;
-
-#ifdef ENABLE_FILTER_LOGGING
-                dst_port = udph->dest;
-#endif
-
-                break;
-
             case IPPROTO_ICMPV6:
+            {
                 // Scan ICMPv6 header.
-                icmp6h = data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
+                struct icmp6hdr *icmp6h = l4_hdr;
 
                 // Check ICMPv6 header.
                 if (unlikely(icmp6h + 1 > (struct icmp6hdr *)data_end))
@@ -293,12 +349,47 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
+                l4_proto = IPPROTO_ICMPV6;
+
+                icmp_type = icmp6h->icmp6_type;
+                icmp_code = icmp6h->icmp6_code;
+
                 break;
+            }
+#endif
+        }
+    }
+
+    // Re-derive the IP header pointers from a fresh packet pointer.
+    // Each layer-4/extension header parsing path above leaves the packet pointers with a different verified range.
+    // Resetting them makes all paths look identical to the BPF verifier which keeps the verification of the filter rules cheap.
+    void *data_fresh = (void *)(long)(*(volatile u32 *)&ctx->data);
+
+    if (iph)
+    {
+        iph = data_fresh + sizeof(struct ethhdr);
+
+        if (unlikely(iph + 1 > (struct iphdr *)data_end))
+        {
+            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+            return XDP_DROP;
+        }
+    }
+#ifdef ENABLE_IPV6
+    else
+    {
+        iph6 = data_fresh + sizeof(struct ethhdr);
+
+        if (unlikely(iph6 + 1 > (struct ipv6hdr *)data_end))
+        {
+            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+            return XDP_DROP;
         }
     }
 #endif
 
-#ifdef ENABLE_FILTERS
     // Update client stats (PPS/BPS).
     u64 ip_pps = 0;
     u64 ip_bps = 0;
@@ -330,7 +421,6 @@ int xdp_prog_main(struct xdp_md *ctx)
     }
 #endif
 #endif
-#endif
 
     // Create rule context.
     rule_ctx_t rule = {0};
@@ -342,19 +432,18 @@ int xdp_prog_main(struct xdp_md *ctx)
 
 #ifdef ENABLE_FILTER_LOGGING
     rule.now = now;
+#endif
+
     rule.protocol = protocol;
+    rule.l4_proto = l4_proto;
     rule.src_port = src_port;
     rule.dst_port = dst_port;
-#endif
+    rule.tcp_flags = tcp_flags;
+    rule.icmp_type = icmp_type;
+    rule.icmp_code = icmp_code;
     
     rule.iph = iph;
-    
-    rule.tcph = tcph;
-    rule.udph = udph;
-    rule.icmph = icmph;
-
     rule.iph6 = iph6;
-    rule.icmph6 = icmp6h;
 
 #ifdef USE_NEW_LOOP
     bpf_loop(MAX_FILTERS, process_rule, &rule, 0);

@@ -11,8 +11,15 @@ struct filter_ip
     u8 dst_cidr;
 
 #ifdef ENABLE_IPV6
+    unsigned int do_src_ip6 : 1;
+    unsigned int do_dst_ip6 : 1;
+
+    // Stored pre-masked (network byte order) along with the prefix mask for each 32-bit word.
     u32 src_ip6[4];
+    u32 src_mask6[4];
+
     u32 dst_ip6[4];
+    u32 dst_mask6[4];
 #endif
 
     unsigned int do_min_ttl : 1;
@@ -107,8 +114,11 @@ struct filter
     unsigned int log : 1;
     unsigned int enabled : 1;
 
+    // The filter's index inside of the config (used for logging).
+    u32 id;
+
     u8 action;
-    u16 block_time;
+    u32 block_time;
 
 #ifdef ENABLE_RL_IP
     unsigned int do_ip_pps : 1;
@@ -165,6 +175,9 @@ struct filter_log_event
 {
     u64 ts;
     int filter_id;
+
+    u8 action;
+    u32 block_time;
 
     int length;
 

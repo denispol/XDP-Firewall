@@ -39,7 +39,8 @@ static void log_msg_raw(int req_lvl, int cur_lvl, int error, const char* log_pat
     char f_msg[len + 1];
     vsnprintf(f_msg, sizeof(f_msg), msg, args);
 
-    char full_msg[len + 6 + 1];
+    // Leave enough room for the "[<level>] " prefix (an int is at most 11 characters).
+    char full_msg[len + 14 + 1];
     snprintf(full_msg, sizeof(full_msg), "[%d] %s", req_lvl, f_msg);
 
     // If we're calculating stats, we need to prepend a new line.
@@ -74,7 +75,8 @@ static void log_msg_raw(int req_lvl, int cur_lvl, int error, const char* log_pat
             return;
         }
 
-        char log_file_msg[len + 22 + 1];
+        // "[YY-MM-DD HH:MM:SS]" prefix + the full message.
+        char log_file_msg[strlen(full_msg) + 32 + 1];
 
         snprintf(log_file_msg, sizeof(log_file_msg), "[%02d-%02d-%02d %02d:%02d:%02d]%s", tm_val->tm_year % 100, tm_val->tm_mon + 1, tm_val->tm_mday,
         tm_val->tm_hour, tm_val->tm_min, tm_val->tm_sec, full_msg);
@@ -134,9 +136,7 @@ int hdl_filters_rb_event(void* ctx, void* data, size_t sz)
     config__t* cfg = (config__t*)ctx;
     filter_log_event_t* e = (filter_log_event_t*)data;
 
-    filter_rule_cfg_t* filter = &cfg->filters[e->filter_id];
-
-    if (filter == NULL)
+    if (sz < sizeof(*e) || e->filter_id < 0 || e->filter_id >= MAX_FILTERS)
     {
         return 1;
     }
@@ -157,14 +157,14 @@ int hdl_filters_rb_event(void* ctx, void* data, size_t sz)
 
     char* action = "Dropped";
     
-    if (filter->action == 1)
+    if (e->action == 1)
     {
         action = "Passed";
     }
 
     const char* protocol_str = get_protocol_str_by_id(e->protocol);
 
-    log_msg(cfg, 0, 0, "[FILTER %d] %s %s packet '%s:%d' => '%s:%d' (IP PPS => %llu, IP BPS => %llu, Flow PPS => %llu, Flow BPS => %llu Filter Block Time => %llu, length => %d)...", e->filter_id + 1, action, protocol_str, src_ip_str, htons(e->src_port), dst_ip_str, htons(e->dst_port), e->ip_pps, e->ip_bps, e->flow_pps, e->flow_bps, filter->block_time, e->length);
+    log_msg(cfg, 0, 0, "[FILTER %d] %s %s packet '%s:%d' => '%s:%d' (IP PPS => %llu, IP BPS => %llu, Flow PPS => %llu, Flow BPS => %llu Filter Block Time => %u, length => %d)...", e->filter_id + 1, action, protocol_str, src_ip_str, ntohs(e->src_port), dst_ip_str, ntohs(e->dst_port), e->ip_pps, e->ip_bps, e->flow_pps, e->flow_bps, e->block_time, e->length);
 
     return 0;
 }

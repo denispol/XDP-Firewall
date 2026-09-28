@@ -145,6 +145,8 @@ int main(int argc, char *argv[])
     {
         print_cfg(&cfg);
 
+        free_cfg(&cfg);
+
         return EXIT_SUCCESS;
     }
 
@@ -167,11 +169,11 @@ int main(int argc, char *argv[])
     // Raise RLimit.
     struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
 
+    // Kernels 5.11+ account BPF memory through memory cgroups and don't require this, so only warn on failure.
+    // If the limit is actually required, loading the BPF program below will fail and report the error.
     if (setrlimit(RLIMIT_MEMLOCK, &rl)) 
     {
-        log_msg(&cfg, 0, 1, "[ERROR] Failed to raise rlimit. Please make sure this program is ran as root!\n");
-
-        return EXIT_FAILURE;
+        log_msg(&cfg, 1, 0, "[WARNING] Failed to raise RLimit (MEMLOCK). Please make sure this program is ran as root!");
     }
 
     log_msg(&cfg, 2, 0, "Loading XDP/BPF program at '%s'...", XDP_OBJ_PATH);
@@ -196,11 +198,15 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    int if_idx[MAX_INTERFACES] = {0};
+    // Keep track of the interfaces we've attached to so we detach from the same interfaces on exit (even if the config is reloaded).
+    int attached_idx[MAX_INTERFACES] = {0};
+    char attached_names[MAX_INTERFACES][IF_NAMESIZE] = {{0}};
+    int attached_cnt = 0;
+
     int attach_success = 0;
 
     // Attach XDP program to interface(s).
-    for (int i = 0; i < cfg.interfaces_cnt; i++)
+    for (int i = 0; i < cfg.interfaces_cnt && i < MAX_INTERFACES; i++)
     {
         const char* interface = cfg.interfaces[i];
 
@@ -211,24 +217,24 @@ int main(int argc, char *argv[])
 
         log_msg(&cfg, 4, 0, "Retrieving interface index for '%s'...", interface);
 
-        // Get interface index.
-        if_idx[i] = if_nametoindex(interface);
+        // Get interface index (0 indicates failure).
+        unsigned int if_idx = if_nametoindex(interface);
     
-        if (if_idx[i] < 0)
+        if (if_idx == 0)
         {
             log_msg(&cfg, 0, 1, "[WARNING] Failed to retrieve index of network interface '%s'.\n", interface);
     
             continue;
         }
 
-        log_msg(&cfg, 3, 0, "Interface index for '%s' => %d.", interface, if_idx[i]);
+        log_msg(&cfg, 3, 0, "Interface index for '%s' => %u.", interface, if_idx);
 
         log_msg(&cfg, 2, 0, "Attaching XDP program to interface '%s'...", interface);
     
         // Attach XDP program.
         char* mode_used = NULL;
     
-        if ((ret = attach_xdp(prog, &mode_used, if_idx[i], 0, cli.skb, cli.offload)) != 0)
+        if ((ret = attach_xdp(prog, &mode_used, if_idx, 0, cli.skb, cli.offload)) != 0)
         {
             log_msg(&cfg, 0, 1, "[WARNING] Failed to attach XDP program to interface '%s' using available modes (%d).\n", interface, ret);
 
@@ -239,6 +245,10 @@ int main(int argc, char *argv[])
         {
             log_msg(&cfg, 1, 0, "Attached XDP program to interface '%s' using mode '%s'...", interface, mode_used);
         }
+
+        attached_idx[attached_cnt] = if_idx;
+        snprintf(attached_names[attached_cnt], sizeof(attached_names[attached_cnt]), "%s", interface);
+        attached_cnt++;
 
         if (!attach_success)
         {
@@ -410,8 +420,8 @@ int main(int argc, char *argv[])
     signal(SIGINT, hdl_signal);
     signal(SIGTERM, hdl_signal);
 
-    // Receive CPU count for stats map parsing.
-    int cpus = get_nprocs_conf();
+    // Receive possible CPU count for per-CPU stats map parsing.
+    int cpus = libbpf_num_possible_cpus();
 
     log_msg(&cfg, 4, 0, "Retrieved %d CPUs on host.", cpus);
 
@@ -451,14 +461,64 @@ int main(int argc, char *argv[])
             if (stat(cli.cfg_file, &conf_stat) == 0 && conf_stat.st_mtime > last_config_check) {
                 log_msg(&cfg, 3, 0, "Config file change detected during update. Attempting to reload config...");
                 
-                // Reload config.
-                if ((ret = load_cfg(&cfg, cli.cfg_file, 1, &cfg_overrides)) != 0)
+                // Reload config into a separate structure so the current config stays intact if loading fails.
+                config__t* new_cfg = calloc(1, sizeof(config__t));
+
+                if (!new_cfg)
+                {
+                    log_msg(&cfg, 1, 0, "[WARNING] Failed to allocate memory for config reload...");
+                }
+                else if ((ret = load_cfg(new_cfg, cli.cfg_file, 1, &cfg_overrides)) != 0)
                 {
                     log_msg(&cfg, 1, 0, "[WARNING] Failed to load config after update check (%d)...\n", ret);
+
+                    free_cfg(new_cfg);
+                    free(new_cfg);
                 }
                 else
                 {
+#ifdef ENABLE_IP_RANGE_DROP
+                    // Remove IP ranges that no longer exist in the config.
+                    if (map_range_drop > -1)
+                    {
+                        remove_stale_range_drops(map_range_drop, &cfg, new_cfg);
+                    }
+#endif
+
+                    // Swap in the new config (the address of cfg must stay the same since it is used by the ring buffer callback).
+                    free_cfg(&cfg);
+                    memcpy(&cfg, new_cfg, sizeof(cfg));
+                    free(new_cfg);
+
                     log_msg(&cfg, 4, 0, "Config reloaded successfully...");
+
+                    // Interfaces are only attached on startup, so let the user know if the interface list changed.
+                    int interfaces_changed = (cfg.interfaces_cnt != attached_cnt);
+
+                    for (int i = 0; i < cfg.interfaces_cnt && !interfaces_changed; i++)
+                    {
+                        int found = 0;
+
+                        for (int j = 0; j < attached_cnt; j++)
+                        {
+                            if (cfg.interfaces[i] && strcmp(cfg.interfaces[i], attached_names[j]) == 0)
+                            {
+                                found = 1;
+
+                                break;
+                            }
+                        }
+
+                        if (!found)
+                        {
+                            interfaces_changed = 1;
+                        }
+                    }
+
+                    if (interfaces_changed)
+                    {
+                        log_msg(&cfg, 1, 0, "[WARNING] Interface list differs from attached interfaces. Restart the firewall to apply interface changes.");
+                    }
 
                     // Make sure we set doing_stats properly.
                     if (!cfg.no_stats && !doing_stats)
@@ -473,6 +533,14 @@ int main(int argc, char *argv[])
 #ifdef ENABLE_FILTERS
                     // Update filters.
                     update_filters(map_filters, &cfg);
+#endif
+
+#ifdef ENABLE_IP_RANGE_DROP
+                    // Update IP range drops.
+                    if (map_range_drop > -1)
+                    {
+                        update_range_drops(map_range_drop, &cfg);
+                    }
 #endif
                 }
 
@@ -511,21 +579,14 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // Detach XDP program from interfaces.
-    for (int i = 0; i < MAX_INTERFACES; i++)
+    // Detach XDP program from the interfaces we attached to.
+    for (int i = 0; i < attached_cnt; i++)
     {
-        const char* interface = cfg.interfaces[i];
-    
-        if (!interface)
-        {
-            continue;
-        }
-
         char* mode_used = NULL;
 
-        if (attach_xdp(prog, &mode_used, if_idx[i], 1, cli.skb, cli.offload))
+        if (attach_xdp(prog, &mode_used, attached_idx[i], 1, cli.skb, cli.offload))
         {
-            log_msg(&cfg, 0, 0, "[WARNING] Failed to detach XDP program from interface '%s'.\n", interface);
+            log_msg(&cfg, 0, 0, "[WARNING] Failed to detach XDP program from interface '%s'.\n", attached_names[i]);
         }
     }
 
@@ -543,6 +604,8 @@ int main(int argc, char *argv[])
     xdp_program__close(prog);
 
     log_msg(&cfg, 1, 0, "Exiting.\n");
+
+    free_cfg(&cfg);
 
     // Exit program successfully.
     return EXIT_SUCCESS;

@@ -25,7 +25,7 @@
 #define ntohl(x) ((__be32)___constant_swab32((x)))
 #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define htons(x) (x)
-#define ntohs(X) (x)
+#define ntohs(x) (x)
 #define htonl(x) (x)
 #define ntohl(x) (x)
 #endif
@@ -33,6 +33,28 @@
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
+
+#ifndef memset
+#define memset(dest, c, n) __builtin_memset((dest), (c), (n))
+#endif
+
+// Fragment offset mask for the IPv4 'frag_off' field (host byte order).
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1FFF
+#endif
+
+// Fragment offset mask for the IPv6 fragment header's 'frag_off' field (host byte order).
+#ifndef IPV6_FRAG_OFFSET
+#define IPV6_FRAG_OFFSET 0xFFF8
+#endif
+
+struct ipv6_frag_hdr
+{
+    u8 nexthdr;
+    u8 reserved;
+    __be16 frag_off;
+    __be32 identification;
+};
 
 static __always_inline int is_ip_in_range(u32 src_ip, u32 net_ip, u8 cidr);
 
