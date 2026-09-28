@@ -84,16 +84,18 @@ int main(int argc, char *argv[])
 
         printf("  --sip             The source IPv4 address (with CIDR support).\n");
         printf("  --dip             The destination IPv4 address (with CIDR support).\n");
-        printf("  --sip6            The source IPv6 address.\n");
-        printf("  --dip6            The destination IPv6 address.\n");
+        printf("  --sip6            The source IPv6 address (with prefix support).\n");
+        printf("  --dip6            The destination IPv6 address (with prefix support).\n");
         printf("  --min-ttl         The minimum IP TTL to match.\n");
         printf("  --max-ttl         The maximum IP TTL to match.\n");
         printf("  --min-len         The minimum packet length to match.\n");
         printf("  --max-len         The maximum packet length to match.\n");
         printf("  --tos             The IP Type of Service to match.\n\n");
 
-        printf("  --pps             The minimum packet rate (per second) to match.\n");
-        printf("  --bps             The minimum byte rate (per second) to match\n\n");
+        printf("  --ip-pps          The minimum packet rate (per second) of a source IP to match.\n");
+        printf("  --ip-bps          The minimum byte rate (per second) of a source IP to match.\n");
+        printf("  --flow-pps        The minimum packet rate (per second) of a source flow to match.\n");
+        printf("  --flow-bps        The minimum byte rate (per second) of a source flow to match.\n\n");
         
         printf("  --tcp             Enable or disables matching on the TCP protocol.\n");
         printf("  --tsport          The TCP source port to match on.\n");
@@ -116,6 +118,14 @@ int main(int argc, char *argv[])
         printf("  --type            The ICMP type to match on.\n");
 
         return EXIT_SUCCESS;
+    }
+
+    // Check mode.
+    if (cli.mode < 0 || cli.mode > 2)
+    {
+        fprintf(stderr, "[ERROR] Invalid mode (%d). Mode must be 0 (filters), 1 (IPv4 range drop), or 2 (IP block map).\n", cli.mode);
+
+        return EXIT_FAILURE;
     }
 
     // Check for config file path.
@@ -176,9 +186,9 @@ int main(int argc, char *argv[])
             idx = get_next_filter_idx(&cfg);
         }
 
-        if (idx < 0)
+        if (idx < 0 || idx >= MAX_FILTERS)
         {
-            fprintf(stderr, "Failed to retrieve filter next. Make sure you haven't exceeded the maximum filters allowed (%d).\n", MAX_FILTERS);
+            fprintf(stderr, "Invalid filter index or no filter index available. Make sure you haven't exceeded the maximum filters allowed (%d).\n", MAX_FILTERS);
 
             return EXIT_FAILURE;
         }
@@ -206,22 +216,22 @@ int main(int argc, char *argv[])
 
         if (cli.src_ip)
         {
-            new_filter.ip.src_ip = cli.src_ip;
+            new_filter.ip.src_ip = strdup(cli.src_ip);
         }
 
         if (cli.dst_ip)
         {
-            new_filter.ip.dst_ip = cli.dst_ip;
+            new_filter.ip.dst_ip = strdup(cli.dst_ip);
         }
 
         if (cli.src_ip6)
         {
-            new_filter.ip.src_ip6 = cli.src_ip6;
+            new_filter.ip.src_ip6 = strdup(cli.src_ip6);
         }
 
         if (cli.dst_ip6)
         {
-            new_filter.ip.dst_ip6 = cli.dst_ip6;
+            new_filter.ip.dst_ip6 = strdup(cli.dst_ip6);
         }
 
         // To Do: See if I can create a macro for below.
@@ -278,12 +288,12 @@ int main(int argc, char *argv[])
 
         if (cli.tcp_sport)
         {
-            new_filter.tcp.sport = cli.tcp_sport;
+            new_filter.tcp.sport = strdup(cli.tcp_sport);
         }
 
         if (cli.tcp_dport)
         {
-            new_filter.tcp.dport = cli.tcp_dport;
+            new_filter.tcp.dport = strdup(cli.tcp_dport);
         }
 
         if (cli.tcp_urg > -1)
@@ -333,12 +343,12 @@ int main(int argc, char *argv[])
 
         if (cli.udp_sport)
         {
-            new_filter.udp.sport = cli.udp_sport;
+            new_filter.udp.sport = strdup(cli.udp_sport);
         }
 
         if (cli.udp_dport)
         {
-            new_filter.udp.dport = cli.udp_dport;
+            new_filter.udp.dport = strdup(cli.udp_dport);
         }
 
         if (cli.icmp_enabled > -1)
@@ -356,8 +366,24 @@ int main(int argc, char *argv[])
             new_filter.icmp.type = cli.icmp_type;
         }
 
-        // Set filter at index.
+        // Make sure the filter is valid before applying it.
+        filter_t filter_check;
+
+        if (build_filter(&new_filter, idx, &filter_check) != 0)
+        {
+            fprintf(stderr, "[ERROR] Filter has invalid settings (check IP addresses, ports, and value ranges).\n");
+
+            return EXIT_FAILURE;
+        }
+
+        // Set filter at index (freeing the filter that was previously at this index, if any).
+        set_filter_defaults(&cfg.filters[idx]);
         cfg.filters[idx] = new_filter;
+
+        if (idx >= cfg.filters_cnt)
+        {
+            cfg.filters_cnt = idx + 1;
+        }
 
         // Update filters.
         fprintf(stdout, "Updating filters (index %d)...\n", idx);
@@ -392,6 +418,13 @@ int main(int argc, char *argv[])
         // Parse IP range.
         ip_range_t range = parse_ip_range(cli.ip);
 
+        if (!range.success)
+        {
+            fprintf(stderr, "Invalid IP range '%s'.\n", cli.ip);
+
+            return EXIT_FAILURE;
+        }
+
         // Attempt to add range.
         if ((ret = add_range_drop(map_range_drop, range.ip, range.cidr)) != 0)
         {
@@ -415,6 +448,7 @@ int main(int argc, char *argv[])
             }
 
             cfg.drop_ranges[idx] = strdup(cli.ip);
+            cfg.drop_ranges_cnt++;
         }
     }
     // Handle block map mode.
@@ -433,7 +467,7 @@ int main(int argc, char *argv[])
 
         if (cli.expires > 0)
         {
-            expires_rel = get_boot_nano_time() + ((u64)cli.expires * 1e9);
+            expires_rel = get_boot_nano_time() + ((u64)cli.expires * 1000000000ULL);
         }
 
         int map_block = get_map_fd_pin(XDP_MAP_PIN_DIR, "map_block");
@@ -459,12 +493,9 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
 
+            // The XDP program uses the raw address bytes as the key.
             u128 ip = 0;
-
-            for (int i = 0; i < 16; i++)
-            {
-                ip = (ip << 8) | addr.s6_addr[i];
-            }
+            memcpy(&ip, addr.s6_addr, sizeof(ip));
 
             if ((ret = add_block6(map_block6, ip, expires_rel)) != 0)
             {
@@ -500,14 +531,15 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
 
-            if (cli.expires > 0)
-            {
-                printf("Added '%s' to block map for %lld seconds...\n", cli.ip, cli.expires);
-            }
-            else
-            {
-                printf("Added '%s' to block map indefinitely...\n", cli.ip);
-            }
+        }
+
+        if (cli.expires > 0)
+        {
+            printf("Added '%s' to block map for %lld seconds...\n", cli.ip, (long long) cli.expires);
+        }
+        else
+        {
+            printf("Added '%s' to block map indefinitely...\n", cli.ip);
         }
     }
 
@@ -525,6 +557,8 @@ int main(int argc, char *argv[])
     }
 
     printf("Success! Exiting.\n");
+
+    free_cfg(&cfg);
 
     return EXIT_SUCCESS;
 }

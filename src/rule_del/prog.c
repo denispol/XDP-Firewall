@@ -41,6 +41,14 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
+    // Check mode.
+    if (cli.mode < 0 || cli.mode > 2)
+    {
+        fprintf(stderr, "[ERROR] Invalid mode (%d). Mode must be 0 (filters), 1 (IPv4 range drop), or 2 (IP block map).\n", cli.mode);
+
+        return EXIT_FAILURE;
+    }
+
     // Check for config file path.
     if ((cli.save || cli.mode == 0) && (!cli.cfg_file || strlen(cli.cfg_file) < 1))
     {
@@ -70,9 +78,9 @@ int main(int argc, char *argv[])
         printf("Using filters mode (0)...\n");
 
         // Check index.
-        if (cli.idx < 1)
+        if (cli.idx < 1 || cli.idx > MAX_FILTERS)
         {
-            fprintf(stderr, "Invalid filter index. Index must start from 1.\n");
+            fprintf(stderr, "Invalid filter index. Index must be between 1 and %d.\n", MAX_FILTERS);
 
             return EXIT_FAILURE;
         }
@@ -89,45 +97,19 @@ int main(int argc, char *argv[])
 
         printf("Using 'map_filters' FD => %d...\n", map_filters);
 
-        int idx = -1;
+        // The index is the filter's index inside of the config (as shown by xdpfw -l).
+        // Filters inside of the BPF map are rebuilt from the config below (disabled filters are skipped), so we only need to remove it from the config.
         int cfg_idx = cli.idx - 1;
-        int cur_idx = 0;
 
-        // This is where things are a bit tricky due to the layout of our filtering system in XDP.
-        // Since each filter rule doesn't have any unique identifier other than the index, we need to use that.
-        // However, rules that are not enabled are not inserted into the BPF map which can mismatch the indexes in the config and XDP program.
-        // So we need to loop through each and ignore disabled rules.
-        for (int i = 0; i < MAX_FILTERS; i++)
+        if (!cfg.filters[cfg_idx].set)
         {
-            filter_rule_cfg_t* filter = &cfg.filters[i];
-
-            if (!filter->set || !filter->enabled)
-            {
-                continue;
-            }
-
-            if (i == cur_idx)
-            {
-                idx = cur_idx;
-
-                break;
-            }
-
-            cur_idx++;
-        }
-
-        if (idx < 0)
-        {
-            fprintf(stderr, "[ERROR] Failed to find proper index in config file (%d).\n", idx);
+            fprintf(stderr, "[ERROR] Filter #%d doesn't exist in the config.\n", cli.idx);
 
             return EXIT_FAILURE;
         }
 
-        // Unset affected filter in config.
-        if (cli.save)
-        {
-            cfg.filters[cfg_idx].set = 0;
-        }
+        // Unset affected filter in config (this also frees its memory).
+        set_filter_defaults(&cfg.filters[cfg_idx]);
 
         // Update filters.
         fprintf(stdout, "Updating filters...\n");
@@ -162,6 +144,13 @@ int main(int argc, char *argv[])
         // Parse IP range.
         ip_range_t range = parse_ip_range(cli.ip);
 
+        if (!range.success)
+        {
+            fprintf(stderr, "Invalid IP range '%s'.\n", cli.ip);
+
+            return EXIT_FAILURE;
+        }
+
         // Attempt to delete range.
         if ((ret = delete_range_drop(map_range_drop, range.ip, range.cidr)) != 0)
         {
@@ -191,6 +180,7 @@ int main(int argc, char *argv[])
 
                 free((void*)cfg.drop_ranges[i]);
                 cfg.drop_ranges[i] = NULL;
+                cfg.drop_ranges_cnt--;
             }
         }
     }
@@ -229,12 +219,9 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
 
+            // The XDP program uses the raw address bytes as the key.
             u128 ip = 0;
-
-            for (int i = 0; i < 16; i++)
-            {
-                ip = (ip << 8) | addr.s6_addr[i];
-            }
+            memcpy(&ip, addr.s6_addr, sizeof(ip));
 
             if ((ret = delete_block6(map_block6, ip)) != 0)
             {
@@ -242,6 +229,8 @@ int main(int argc, char *argv[])
 
                 return EXIT_FAILURE;
             }
+
+            printf("Deleted IP '%s'...\n", cli.ip);
         }
         else
         {
@@ -288,6 +277,8 @@ int main(int argc, char *argv[])
     }
 
     printf("Success! Exiting.\n");
+
+    free_cfg(&cfg);
 
     return EXIT_SUCCESS;
 }
